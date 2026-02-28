@@ -1162,25 +1162,9 @@ class GroupCoordinator:
         async_send: bool = False,
         metadata_cache_key: Optional[str] = None,
     ) -> Optional[List[P2PWork]]:
-        """Send the input tensor dictionary.
-        NOTE: `dst` is the local rank of the destination rank.
-
-        If metadata_cache_key is provided, the metadata (keys, dtypes, shapes)
-        will be cached after the first send. On subsequent sends with the same
-        cache key where the schema hasn't changed, metadata transfer over the
-        CPU group is skipped entirely, eliminating expensive Gloo round-trips.
-
-        Protocol when metadata_cache_key is set:
-        1. Send a 1-element int8 GPU signal tensor via NCCL device group:
-           - 0 = use cached metadata (no CPU metadata follows)
-           - 1 = new metadata follows on CPU group
-        2. If signal=1: send full metadata via send_object (CPU group)
-        3. Send tensor data via device group (same as without caching)
-
-        The NCCL signal is essentially free since we're already sending
-        tensor data over the same device group.
-        """
-        # Bypass the function if we are using only 1 GPU.
+        """Send tensor dict to dst. When metadata_cache_key is set, metadata
+        is cached and a 1-byte NCCL signal (0=hit, 1=miss) replaces the
+        CPU-group metadata transfer on cache hits."""
         if self.world_size == 1:
             return tensor_dict
 
@@ -1188,14 +1172,12 @@ class GroupCoordinator:
         all_gather_rank = (
             0 if all_gather_group is None else all_gather_group.rank_in_group
         )
-
         group = self.device_group
         metadata_group = self.cpu_group
 
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
-
         assert isinstance(
             tensor_dict, dict
         ), f"Expecting a dictionary, got {type(tensor_dict)}"
@@ -1209,21 +1191,18 @@ class GroupCoordinator:
             cached = cache.get(metadata_cache_key)
             cache_hit = cached is not None and cached == metadata_list
 
-            # Send signal via NCCL (device group) — negligible cost
-            signal_val = 0 if cache_hit else 1
-            signal = torch.tensor([signal_val], dtype=torch.int8, device=self.device)
-            signal_work = send_func(signal, self.ranks[dst], group=group)
+            # Send signal via NCCL (device group)
+            sig_hit, sig_miss, _ = self._get_cache_signal_bufs()
+            signal = sig_hit if cache_hit else sig_miss
+            work = send_func(signal, self.ranks[dst], group=group)
             if async_send:
-                p2p_works.append(P2PWork(signal_work, signal))
-
+                p2p_works.append(P2PWork(work, signal))
             if not cache_hit:
-                # Schema changed or first time — send full metadata on CPU
                 p2p_works.extend(
                     self.send_object(metadata_list, dst=dst, async_send=async_send)
                 )
                 cache[metadata_cache_key] = list(metadata_list)
         else:
-            # No caching — send metadata as before
             p2p_works.extend(
                 self.send_object(metadata_list, dst=dst, async_send=async_send)
             )
@@ -1231,10 +1210,8 @@ class GroupCoordinator:
         for tensor in tensor_list:
             if tensor.numel() == 0:
                 continue
-
             if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
-
             comm_group = metadata_group if tensor.is_cpu else group
             work = send_func(tensor, self.ranks[dst], group=comm_group)
             if async_send:
@@ -1247,14 +1224,7 @@ class GroupCoordinator:
         all_gather_group: Optional["GroupCoordinator"] = None,
         metadata_cache_key: Optional[str] = None,
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
-        """Recv the input tensor dictionary.
-        NOTE: `src` is the local rank of the source rank.
-
-        If metadata_cache_key is provided, first receives a 1-element int8
-        NCCL signal:
-        - 0 = use cached metadata (skip CPU recv)
-        - 1 = receive fresh metadata from CPU group and update cache
-        """
+        """Recv tensor dict from src. See send_tensor_dict for caching protocol."""
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return None
 
@@ -1262,7 +1232,6 @@ class GroupCoordinator:
         all_gather_rank = (
             0 if all_gather_group is None else all_gather_group.rank_in_group
         )
-
         group = self.device_group
         metadata_group = self.cpu_group
 
@@ -1271,18 +1240,13 @@ class GroupCoordinator:
         assert src < self.world_size, f"Invalid src rank ({src})"
 
         if metadata_cache_key is not None:
-            # Receive NCCL signal
-            signal = torch.empty(1, dtype=torch.int8, device=self.device)
-            work = torch.distributed.irecv(signal, src=self.ranks[src], group=group)
-            work.wait()
-            signal_val = signal.item()
-
+            # Receive 1-byte NCCL signal via pre-allocated buffer
+            _, _, recv_buf = self._get_cache_signal_bufs()
+            torch.distributed.recv(recv_buf, src=self.ranks[src], group=group)
             cache = self._get_recv_metadata_cache()
-            if signal_val == 0:
-                # Cache hit — use cached metadata
+            if recv_buf.item() == 0:
                 recv_metadata_list = cache[metadata_cache_key]
             else:
-                # Cache miss — receive fresh metadata on CPU
                 recv_metadata_list = self.recv_object(src=src)
                 cache[metadata_cache_key] = recv_metadata_list
         else:
@@ -1298,7 +1262,6 @@ class GroupCoordinator:
                 if tensor.numel() == 0:
                     tensor_dict[key] = tensor
                     continue
-
                 use_all_gather = (
                     all_gather_group is not None
                     and tensor.numel() % all_gather_size == 0
@@ -1320,23 +1283,27 @@ class GroupCoordinator:
         # Second pass: wait for completion and post-process
         for key, tensor, work, use_all_gather, orig_shape in pending_works:
             work.wait()
-
             if use_all_gather:
                 tensor = all_gather_group.all_gather(tensor, dim=0)
                 tensor = tensor.reshape(orig_shape)
-
             tensor_dict[key] = tensor
         return tensor_dict
 
+    def _get_cache_signal_bufs(self):
+        """Return pre-allocated (hit, miss, recv) signal tensors for metadata caching.
+        These are created once and reused to avoid CUDA alloc overhead per call."""
+        try:
+            return self._cache_sig_hit, self._cache_sig_miss, self._cache_sig_recv
+        except AttributeError:
+            self._cache_sig_hit = torch.zeros(1, dtype=torch.int8, device=self.device)
+            self._cache_sig_miss = torch.ones(1, dtype=torch.int8, device=self.device)
+            self._cache_sig_recv = torch.empty(1, dtype=torch.int8, device=self.device)
+            return self._cache_sig_hit, self._cache_sig_miss, self._cache_sig_recv
+
     def invalidate_metadata_cache(self, cache_key: str) -> None:
-        """Invalidate a metadata cache entry on both send and recv sides.
-        Call this when the tensor dict schema is expected to change
-        (e.g., on prefill/decode transitions).
-        """
-        send_cache = self._get_send_metadata_cache()
-        recv_cache = self._get_recv_metadata_cache()
-        send_cache.pop(cache_key, None)
-        recv_cache.pop(cache_key, None)
+        """Invalidate a metadata cache entry on both send and recv sides."""
+        self._get_send_metadata_cache().pop(cache_key, None)
+        self._get_recv_metadata_cache().pop(cache_key, None)
 
     def _get_send_metadata_cache(self) -> Dict[str, Any]:
         try:

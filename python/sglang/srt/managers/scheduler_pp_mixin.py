@@ -46,37 +46,11 @@ class PPBatchMetadata:
 class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
-        """
-        A scheduler loop for pipeline parallelism.
-        Notes:
-        1. Each stage runs in the same order and is notified by the previous stage.
-        2. We use async send but sync recv to avoid desynchronization while minimizing the communication overhead.
-        3. We can use async batch depth to buffer the outputs in the last stage for to allow overlapping the GPU computation and CPU processing and avoid last PP rank staggler.
-
-        Unified Schedule:
-        ====================================================================
-        Stage P
-        recv ith req from previous stage
-        recv ith proxy from previous stage
-        run ith batch
-        recv prev (i+1)% mb_size th outputs
-        process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
-        send ith req to next stage
-        send ith proxy to next stage
-        send current stage's outputs to next stage(can be stashed and delayed to send later)
-
-        the above order can be optimized and reordered to minimize communication-related CPU stall and overhead bubbles.
-
-        ====================================================================
-        """
+        """PP scheduler loop. Each stage runs in lock-step; async send + sync recv.
+        Requests are bundled into proxy tensors on busy steps to avoid extra
+        Gloo round-trips. Metadata caching skips CPU metadata on cache hits."""
         self.init_pp_loop_state()
-
-        # [Optimization] Buffer for bundling requests
         self.buffered_recv_reqs = []
-        # Requests received on PP0 during busy steps that haven't been
-        # processed into the waiting queue yet.  They are deferred by one
-        # step so that non-first ranks (which receive them via bundled
-        # proxy tensors) see them at the same scheduling step.
         self._pp0_deferred_reqs = []
 
         while True:
@@ -86,32 +60,22 @@ class SchedulerPPMixin:
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
+                is_busy = self.mbs[mb_id] is not None
 
-                # Check if we expect to send tensors this step (Busy)
-                is_busy_step = self.mbs[mb_id] is not None
-                recv_reqs = []
-
-                # RANK 0: Always receive from tokenizer, decide how to forward
+                # --- Receive / forward requests ---
                 if self.pp_group.is_first_rank:
-                    # Process requests deferred from the previous busy step.
-                    # PP1 already extracted these from bundled proxy tensors
-                    # on the previous step, so both ranks now see them.
+                    # Flush deferred reqs from previous busy step
                     if self._pp0_deferred_reqs:
                         self.process_input_requests(self._pp0_deferred_reqs)
                         self._pp0_deferred_reqs = []
                     with torch.profiler.record_function("recv_requests"):
                         recv_reqs = self.recv_requests()
-
                     if not self.pp_group.is_last_rank:
-                        if is_busy_step:
-                            # Defer local processing to stay in sync with
-                            # non-first ranks which receive these via
-                            # bundled proxy tensors (after scheduling).
+                        if is_busy:
+                            # Defer: non-first ranks get these via bundled proxy tensors
                             self._pp0_deferred_reqs.extend(recv_reqs)
-                            # Buffer for bundled sending with proxy tensors
                             self.buffered_recv_reqs.extend(recv_reqs)
                         else:
-                            # Idle: process immediately and send via pyobj
                             self.process_input_requests(recv_reqs)
                             to_send = self.buffered_recv_reqs + recv_reqs
                             self.buffered_recv_reqs = []
@@ -120,38 +84,22 @@ class SchedulerPPMixin:
                                 to_send, async_send=True
                             )
                     else:
-                        # First rank is also last rank (single-stage PP)
                         self.process_input_requests(recv_reqs)
-                # RANK > 0: Receive logic
-                else:
-                    if not is_busy_step:
-                        # Idle mode: blocking receive to wait for work
-                        recv_reqs = self.recv_requests()
-                        self.process_input_requests(recv_reqs)
-                    # Busy mode: bundled reqs arrive bundled in proxy tensors
+                elif not is_busy:
+                    # Non-first rank, idle: blocking recv for work
+                    self.process_input_requests(self.recv_requests())
+                    # Busy: bundled reqs arrive inside proxy tensors
 
-                # [Optimization] Prefer packing: if this slot is empty but OTHER slots are active
-                # and NOT full, skip this slot to let the scheduler prioritize filling the active ones.
-                # This reduces the number of small, fragmented batches (high overhead) and promotes
-                # fewer, larger batches (better throughput).
-                should_skip_allocation = False
-                if self.mbs[mb_id] is None:
-                    # Check if there are other active batches that have room
-                    for other_mb in self.running_mbs:
-                        if (
-                            other_mb is not None
-                            and len(other_mb.reqs) > 0
-                            and not other_mb.batch_is_full
-                        ):
-                            # Found a better candidate; we should wait for it instead of starting a new batch here.
-                            should_skip_allocation = True
-                            break
-                with torch.profiler.record_function("get_next_batch_to_run"):
-                    if should_skip_allocation:
-                        # Skip getting a new batch, forcing this slot to remain empty
-                        self.mbs[mb_id] = None
-                    else:
+                # --- Skip allocation if another slot has room (prefer packing) ---
+                if self.mbs[mb_id] is None and any(
+                    mb is not None and len(mb.reqs) > 0 and not mb.batch_is_full
+                    for mb in self.running_mbs
+                ):
+                    self.mbs[mb_id] = None
+                else:
+                    with torch.profiler.record_function("get_next_batch_to_run"):
                         self.mbs[mb_id] = self.get_next_batch_to_run()
+
                 self.running_mbs[mb_id] = self.running_batch
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
@@ -159,9 +107,9 @@ class SchedulerPPMixin:
                     pp_proxy_tensors = self._pp_recv_proxy_tensors(
                         metadata_cache_key=f"pp_proxy_{mb_id}"
                     )
-                next_pp_outputs = None
-                next_batch_result = None
-                d2h_event = None
+
+                # --- Output processing (async or sync) ---
+                next_pp_outputs = next_batch_result = d2h_event = None
                 if self.server_args.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -194,34 +142,26 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
-                if not self.pp_group.is_last_rank:
-                    if self.cur_batch:
-                        torch.cuda.current_stream().wait_event(self.launch_event)
-                        with torch.profiler.record_function(
-                            "send_proxy_dict_to_next_stage"
-                        ):
-                            # Attach buffered requests as extra_pyobj.
-                            # When there are bundled reqs the tensor dict
-                            # schema changes, causing an automatic metadata
-                            # cache miss (signal=1 + fresh metadata).  On
-                            # the next step without reqs the schema reverts
-                            # and the cache hits again (signal=0, no CPU
-                            # metadata transfer).
-                            extra_data = {}
-                            if self.buffered_recv_reqs:
-                                extra_data["__bundled_reqs__"] = self.buffered_recv_reqs
-                                self.buffered_recv_reqs = []
 
-                            self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                                result.pp_hidden_states_proxy_tensors.tensors,
-                                async_send=True,
-                                extra_pyobj=extra_data if extra_data else None,
-                                metadata_cache_key=f"pp_proxy_{mb_id}",
-                            )
+                # --- Send proxy tensors (+ bundled reqs) to next stage ---
+                if not self.pp_group.is_last_rank and self.cur_batch:
+                    torch.cuda.current_stream().wait_event(self.launch_event)
+                    with torch.profiler.record_function(
+                        "send_proxy_dict_to_next_stage"
+                    ):
+                        extra = None
+                        if self.buffered_recv_reqs:
+                            extra = {"__bundled_reqs__": self.buffered_recv_reqs}
+                            self.buffered_recv_reqs = []
+                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                            result.pp_hidden_states_proxy_tensors.tensors,
+                            async_send=True,
+                            extra_pyobj=extra,
+                            metadata_cache_key=f"pp_proxy_{mb_id}",
+                        )
 
                 self.pp_outputs = next_pp_outputs
 
-            # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self.self_check_during_idle()
 

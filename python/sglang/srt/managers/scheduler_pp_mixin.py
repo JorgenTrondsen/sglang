@@ -87,7 +87,17 @@ class SchedulerPPMixin:
                         self.process_input_requests(recv_reqs)
                 elif not is_busy:
                     # Non-first rank, idle: blocking recv for work
-                    self.process_input_requests(self.recv_requests())
+                    recv_reqs = self.recv_requests()
+                    self.process_input_requests(recv_reqs)
+
+                    # Middle rank: forward to next stage
+                    if not self.pp_group.is_last_rank:
+                        to_send = self.buffered_recv_reqs + recv_reqs
+                        self.buffered_recv_reqs = []
+                        self._pp_commit_comm_work(self.send_req_work)
+                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                            to_send, async_send=True
+                        )
                     # Busy: bundled reqs arrive inside proxy tensors
 
                 # --- Skip allocation if another slot has room (prefer packing) ---
@@ -990,6 +1000,9 @@ class SchedulerPPMixin:
                 bundled_bytes = bundled_tensor.cpu().numpy().tobytes()
                 bundled_reqs = pickle.loads(bundled_bytes)
                 self.process_input_requests(bundled_reqs)
+                # Middle rank: re-buffer for forwarding to next stage
+                if not self.pp_group.is_last_rank:
+                    self.buffered_recv_reqs.extend(bundled_reqs)
 
             pp_proxy_tensors = PPProxyTensors(recv_dict)
         return pp_proxy_tensors

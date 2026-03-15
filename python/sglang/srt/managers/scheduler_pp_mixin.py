@@ -965,6 +965,7 @@ class SchedulerPPMixin:
         self: Scheduler,
         expected_kind: str = "default",
         all_gather_group: Optional = None,
+        metadata_cache_key: Optional[str] = None,
     ) -> Dict[str, torch.Tensor]:
         """Receive a typed tensor dict, demultiplexing by msg_type.
 
@@ -978,7 +979,8 @@ class SchedulerPPMixin:
 
         while True:
             tensor_dict = self.pp_group.recv_tensor_dict(
-                all_gather_group=all_gather_group
+                all_gather_group=all_gather_group,
+                metadata_cache_key=metadata_cache_key
             )
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:

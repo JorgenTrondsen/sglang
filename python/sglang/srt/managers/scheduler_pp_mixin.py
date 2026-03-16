@@ -79,13 +79,6 @@ class SchedulerPPMixin:
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.recv_requests()
                     self.process_input_requests(recv_reqs)
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
-                    with torch.profiler.record_function("send_reqs_to_next_stage"):
-                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs,
-                            async_send=True,
-                        )
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     self.mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
@@ -95,6 +88,23 @@ class SchedulerPPMixin:
                     pp_proxy_tensors = self._pp_recv_proxy_tensors(
                         metadata_cache_key=f"pp_proxy_{mb_id}"
                     )
+                # Launch current microbatch GPU compute as early as possible
+                if self.cur_batch:
+                    server_is_idle = False
+                    result, self.launch_event = self._pp_launch_batch(
+                        mb_id,
+                        pp_proxy_tensors,
+                        self.mb_metadata,
+                        self.last_rank_comm_queue,
+                    )
+                # Perform blocking CPU/network operations while GPU computes
+                if not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(self.send_req_work)
+                    with torch.profiler.record_function("send_reqs_to_next_stage"):
+                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                            recv_reqs,
+                            async_send=True,
+                        )
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -107,13 +117,6 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
-                if self.cur_batch:
-                    result, self.launch_event = self._pp_launch_batch(
-                        mb_id,
-                        pp_proxy_tensors,
-                        self.mb_metadata,
-                        self.last_rank_comm_queue,
-                    )
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -979,8 +982,7 @@ class SchedulerPPMixin:
 
         while True:
             tensor_dict = self.pp_group.recv_tensor_dict(
-                all_gather_group=all_gather_group,
-                metadata_cache_key=metadata_cache_key
+                all_gather_group=all_gather_group, metadata_cache_key=metadata_cache_key
             )
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:

@@ -1362,9 +1362,6 @@ class GroupCoordinator:
             recv_metadata_list = self.recv_object(src=src)
 
         tensor_dict: Dict[str, Any] = {}
-        pending_works = []
-
-        # First pass: initiate all receives
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
                 tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
@@ -1379,7 +1376,6 @@ class GroupCoordinator:
                     and tensor.numel() % all_gather_size == 0
                 )
 
-                orig_shape = None
                 if use_all_gather:
                     orig_shape = tensor.shape
                     tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
@@ -1389,17 +1385,15 @@ class GroupCoordinator:
                 work = torch.distributed.irecv(
                     tensor, src=self.ranks[src], group=comm_group
                 )
-                pending_works.append((key, tensor, work, use_all_gather, orig_shape))
+                work.wait()
+
+                if use_all_gather:
+                    tensor = all_gather_group.all_gather(tensor, dim=0)
+                    tensor = tensor.reshape(orig_shape)
+
+                tensor_dict[key] = tensor
             else:
                 tensor_dict[key] = value
-
-        # Second pass: wait for completion and post-process
-        for key, tensor, work, use_all_gather, orig_shape in pending_works:
-            work.wait()
-            if use_all_gather:
-                tensor = all_gather_group.all_gather(tensor, dim=0)
-                tensor = tensor.reshape(orig_shape)
-            tensor_dict[key] = tensor
         return tensor_dict
 
     def get_cache_signal_bufs(self):

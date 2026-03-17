@@ -1287,8 +1287,7 @@ class GroupCoordinator:
             cached = cache.get(metadata_cache_key)
             cache_hit = cached is not None and cached == metadata_list
 
-            # Send signal via NCCL (device group)
-            sig_hit, sig_miss, _ = self.get_cache_signal_bufs()
+            sig_hit, sig_miss, _ = self._get_cache_signals()
             signal = sig_hit if cache_hit else sig_miss
             work = send_func(signal, self.ranks[dst], group=group)
             if async_send:
@@ -1344,8 +1343,7 @@ class GroupCoordinator:
         assert src < self.world_size, f"Invalid src rank ({src})"
 
         if metadata_cache_key is not None:
-            # Receive 1-byte NCCL signal via pre-allocated buffer
-            _, _, recv_buf = self.get_cache_signal_bufs()
+            _, _, recv_buf = self._get_cache_signals()
             torch.distributed.recv(recv_buf, src=self.ranks[src], group=group)
 
             try:
@@ -1396,9 +1394,8 @@ class GroupCoordinator:
                 tensor_dict[key] = value
         return tensor_dict
 
-    def get_cache_signal_bufs(self):
-        """Return pre-allocated (hit, miss, recv) signal tensors for metadata caching.
-        These are created once and reused to avoid CUDA alloc overhead per call."""
+    def _get_cache_signals(self):
+        """Return pre-allocated (hit, miss, recv) signal tensors for metadata caching."""
         try:
             return self._cache_sig_hit, self._cache_sig_miss, self._cache_sig_recv
         except AttributeError:
